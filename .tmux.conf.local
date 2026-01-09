@@ -414,6 +414,9 @@ bind C-Space send-prefix
 # display a message after toggling mouse support
 bind m run "cut -c3- '#{TMUX_CONF}' | sh -s _toggle_mouse" \; display 'mouse #{?#{mouse},on,off}'
 
+# status update interval (default: 10 seconds, increased to 30 for slower status commands)
+set -g status-interval 30
+
 # move status line to top
 #set -g status-position top
 
@@ -514,7 +517,6 @@ set -g @continuum-restore 'on'
 # # usage: #{windows_uptime}
 # windows_uptime() {
 #   pwsh.exe -Command "\$up = Get-Uptime; if (\$up.Days -gt 0) { '{0}d {1}h {2}m' -f \$up.Days, \$up.Hours, \$up.Minutes } elseif (\$up.Hours -gt 0) { '{0}h {1}m' -f \$up.Hours, \$up.Minutes } else { '{0}m' -f \$up.Minutes }" 2>/dev/null || printf 'N/A'
-#   sleep 60                                          # sleep for 60 seconds to throttle calls
 # }
 #
 # "$@"
