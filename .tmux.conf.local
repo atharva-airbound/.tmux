@@ -414,6 +414,10 @@ bind C-Space send-prefix
 # display a message after toggling mouse support
 bind m run "cut -c3- '#{TMUX_CONF}' | sh -s _toggle_mouse" \; display 'mouse #{?#{mouse},on,off}'
 
+# keep scroll position when copying with mouse selection
+bind -T copy-mode-vi MouseDragEnd1Pane send -X copy-selection
+bind -T copy-mode MouseDragEnd1Pane send -X copy-selection
+
 # status update interval (default: 10 seconds, increased to 30 for slower status commands)
 set -g status-interval 30
 
