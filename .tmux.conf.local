@@ -467,6 +467,9 @@ set -g @plugin 'tmux-plugins/tmux-resurrect'
 set -g @plugin 'tmux-plugins/tmux-continuum'
 set -g @continuum-restore 'on'
 
+# restart processes on resurrecting
+set -g @resurrect-processes 'claude pwsh.exe ps_exec bookocrat'
+
 
 # -- custom variables ----------------------------------------------------------
 
