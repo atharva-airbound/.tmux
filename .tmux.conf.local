@@ -271,7 +271,9 @@ tmux_conf_theme_right_separator_sub="|"
 #     - #{username_ssh}
 tmux_conf_theme_status_left=" ❐ #S | ↑#{windows_uptime} "
 #tmux_conf_theme_status_left=" ❐ #S | ↑#{?uptime_y, #{uptime_y}y,}#{?uptime_d, #{uptime_d}d,}#{?uptime_h, #{uptime_h}h,}#{?uptime_m, #{uptime_m}m,} | #{pretty_pane_current_path} "
-tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized}#{?battery_status,#{battery_status},}#{?battery_bar, #{battery_bar},}#{?battery_percentage, #{battery_percentage},} | #{username}#{root} | #{hostname} "
+
+# the trailing #(claude-tmux-sync sweep) is because the status line is the one thing tmux re-evaluates every status-interval
+tmux_conf_theme_status_right=" #{prefix}#{mouse}#{pairing}#{synchronized}#{?battery_status,#{battery_status},}#{?battery_bar, #{battery_bar},}#{?battery_percentage, #{battery_percentage},} | #{username}#{root} | #{hostname} #(~/.local/bin/claude-tmux-sync sweep 2>/dev/null)"
 
 # status left style
 tmux_conf_theme_status_left_fg="$tmux_conf_theme_colour_6,$tmux_conf_theme_colour_7,$tmux_conf_theme_colour_8"
@@ -468,7 +470,13 @@ set -g @plugin 'tmux-plugins/tmux-continuum'
 set -g @continuum-restore 'on'
 
 # restart processes on resurrecting
-set -g @resurrect-processes 'claude pwsh.exe ps_exec bookocrat'
+#
+# '~claude --resume' matches the rewritten, space-prefixed commands the hook below produces
+set -g @resurrect-processes '"~claude --resume" claude pwsh.exe ps_exec bookocrat'
+
+# Claude Code panes save as whatever command started them, and every variant except an explicit '--resume <uuid>' breaks on restore
+# This hook rewrites each one to 'claude --resume <real session id>' so they can be restored
+set -g @resurrect-hook-post-save-layout '~/.local/bin/claude-tmux-sync resurrect'
 
 
 # -- custom variables ----------------------------------------------------------

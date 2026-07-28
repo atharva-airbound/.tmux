@@ -1,0 +1,231 @@
+#!/bin/sh
+# claude-tmux-sync -- bridge Claude Code's live session registry into tmux.
+#
+# Claude Code records every running session in $CLAUDE_CONFIG_DIR/sessions/<pid>.json:
+#
+#   {"pid":22621,"sessionId":"dc8c87fc-...","cwd":"/home/user/Git/QC-Tool",
+#    "name":"qc-tool-76","nameSource":"derived","procStart":"32623",...}
+#
+# That file gives us two things tmux cannot work out on its own:
+#
+#   .name       a session title, auto-derived by Claude when -n wasn't passed,
+#               so windows get named without deciding on a name up front
+#   .sessionId  the real session id, recorded however the session was started
+#               (claude, -c, --resume, the interactive picker, claude-session)
+#
+# Subcommands:
+#   rename [pane]     name one window after the Claude session running in it
+#   unname [pane]     hand the window back to tmux's automatic-rename
+#   sweep             rename every window currently running Claude
+#   resurrect <file>  rewrite a tmux-resurrect save file so Claude panes come
+#                     back as `claude --resume <sessionId>`
+
+set -u
+
+SESSIONS_DIR="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/sessions"
+MAX_NAME_LEN=40
+
+# Field 22 of /proc/<pid>/stat is the process start time. Claude stores it as
+# .procStart, which lets us tell a live session from a stale registry file whose
+# pid has since been recycled onto some unrelated process.
+_proc_start() {
+	[ -r "/proc/$1/stat" ] || return 1
+	# Field 2 (comm) is parenthesised and may itself contain spaces, so skip
+	# past it before counting; that shifts every later field down by two.
+	sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}'
+}
+
+# Pull a string value out of Claude's flat, single-line session JSON.
+_json_str() {
+	sed -n 's/.*"'"$2"'":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null
+}
+
+# Print "<sessionId><TAB><name>" for a pid Claude has registered, else fail.
+_session_for_pid() {
+	_sf="$SESSIONS_DIR/$1.json"
+	[ -r "$_sf" ] || return 1
+
+	# Reject a recycled pid: if both start times are readable they must agree.
+	_want=$(_json_str "$_sf" procStart)
+	_have=$(_proc_start "$1") || _have=""
+	if [ -n "$_want" ] && [ -n "$_have" ] && [ "$_want" != "$_have" ]; then
+		return 1
+	fi
+
+	_sid=$(_json_str "$_sf" sessionId)
+	[ -n "$_sid" ] || return 1
+	# .nameSource is "derived" when Claude invented the name, and absent when it
+	# came from -n or /rename. Only the latter is worth overriding tmux with.
+	printf '%s\t%s\t%s\n' "$_sid" "$(_json_str "$_sf" name)" "$(_json_str "$_sf" nameSource)"
+}
+
+# Walk down from a pane's shell pid until we hit a pid Claude has registered.
+# Three levels covers `claude` run directly, run via a wrapper, and node re-execs.
+_claude_pid_below() {
+	_pids="$1"
+	_depth=0
+	while [ "$_depth" -lt 3 ] && [ -n "$_pids" ]; do
+		for _p in $_pids; do
+			if _session_for_pid "$_p" >/dev/null 2>&1; then
+				echo "$_p"
+				return 0
+			fi
+		done
+		_pids=$(pgrep -P "$(echo $_pids | tr ' ' ',')" 2>/dev/null | tr '\n' ' ')
+		_depth=$((_depth + 1))
+	done
+	return 1
+}
+
+_rename_from_shell_pid() {
+	_pane="$1"
+	_shell_pid="$2"
+
+	_cpid=$(_claude_pid_below "$_shell_pid") || return 0
+	_info=$(_session_for_pid "$_cpid") || return 0
+	_name=$(printf '%s' "$_info" | cut -f2)
+	_src=$(printf '%s' "$_info" | cut -f3)
+	[ -n "$_name" ] || return 0
+
+	# Keep the name to one harmless line; '#' would be read as a tmux format.
+	_name=$(printf '%s' "$_name" | tr -d '\n\t#' | cut -c "1-$MAX_NAME_LEN")
+	[ -n "$_name" ] || return 0
+
+	# A name Claude derived from the directory is a fallback, not an opinion, so
+	# it must never overwrite a window the user deliberately named. Take the
+	# window only if it is still on automatic-rename, or if we set its name last
+	# time and nobody has renamed it since. A name from -n or /rename is an
+	# explicit choice and always wins.
+	if [ "$_src" = derived ]; then
+		_auto=$(tmux display -p -t "$_pane" '#{?automatic-rename,on,off}' 2>/dev/null)
+		_cur=$(tmux display -p -t "$_pane" '#{window_name}' 2>/dev/null)
+		_owned=$(tmux show-options -wqv -t "$_pane" @claude_synced_name 2>/dev/null)
+		if [ "$_auto" != on ] && ! { [ -n "$_owned" ] && [ "$_owned" = "$_cur" ]; }; then
+			return 0
+		fi
+	fi
+
+	tmux rename-window -t "$_pane" "$_name" 2>/dev/null
+	# Otherwise automatic-rename would put `claude` straight back.
+	tmux set-window-option -t "$_pane" automatic-rename off 2>/dev/null
+	# Remember what we set, so a later manual rename is recognised as the user's.
+	tmux set-option -w -t "$_pane" @claude_synced_name "$_name" 2>/dev/null
+}
+
+cmd_rename() {
+	_pane="${1:-${TMUX_PANE:-}}"
+	[ -n "$_pane" ] || return 0
+	_shell_pid=$(tmux display -p -t "$_pane" '#{pane_pid}' 2>/dev/null) || return 0
+	[ -n "$_shell_pid" ] || return 0
+	_rename_from_shell_pid "$_pane" "$_shell_pid"
+}
+
+cmd_unname() {
+	_pane="${1:-${TMUX_PANE:-}}"
+	[ -n "$_pane" ] || return 0
+	# Only give the window back if we were the one holding it; a name the user
+	# chose should outlive the session that happened to be running under it.
+	_cur=$(tmux display -p -t "$_pane" '#{window_name}' 2>/dev/null)
+	_owned=$(tmux show-options -wqv -t "$_pane" @claude_synced_name 2>/dev/null)
+	[ -n "$_owned" ] && [ "$_owned" = "$_cur" ] || return 0
+
+	# Unset rather than force on, so the global default decides from here.
+	tmux set-window-option -t "$_pane" -u automatic-rename 2>/dev/null
+	tmux set-option -w -t "$_pane" -u @claude_synced_name 2>/dev/null
+}
+
+cmd_sweep() {
+	# Sorting by pane_active puts the active pane last, so when one window holds
+	# several Claude panes the focused one wins the name.
+	tmux list-panes -a -F '#{pane_active} #{pane_id} #{pane_pid} #{pane_current_command}' 2>/dev/null |
+		sort -k1,1n |
+		while read -r _active _pane _shell_pid _cmd; do
+			[ "$_cmd" = claude ] || continue
+			_rename_from_shell_pid "$_pane" "$_shell_pid"
+		done
+}
+
+# Rewrite Claude panes in a resurrect save file to resume their real session.
+#
+# Resurrect saves whatever command line was used, and every variant except an
+# explicit `--resume <uuid>` breaks on restore: bare `claude` starts a blank
+# session, `--resume` with no id opens the interactive picker, and re-running
+# `--session-id <uuid>` fails because that session already exists. Reading the
+# id back out of the registry after the fact normalises all of them -- and it
+# also catches sessions picked interactively, which no launch wrapper could
+# have predicted.
+cmd_resurrect() {
+	_file="${1:-}"
+	[ -n "$_file" ] && [ -f "$_file" ] || return 0
+
+	_map=$(mktemp) || return 0
+	_out=$(mktemp) || { rm -f "$_map"; return 0; }
+
+	# Saved pane lines key off session name, window index and pane index; the
+	# pid itself is not written to the file, so re-derive it from live tmux.
+	tmux list-panes -a -F '#{session_name}	#{window_index}	#{pane_index}	#{pane_pid}	#{pane_current_command}' 2>/dev/null |
+		while IFS='	' read -r _sess _win _idx _shell_pid _cmd; do
+			[ "$_cmd" = claude ] || continue
+			_cpid=$(_claude_pid_below "$_shell_pid") || continue
+			_sid=$(_session_for_pid "$_cpid" | cut -f1)
+			[ -n "$_sid" ] || continue
+			printf '%s\t%s\t%s\t%s\n' "$_sess" "$_win" "$_idx" "$_sid"
+		done >"$_map"
+
+	awk -F'\t' -v OFS='\t' -v mapfile="$_map" '
+		function normalize(cmdline, sid,   n, t, i, out, skip) {
+			n = split(cmdline, t, / +/)
+			out = ""
+			skip = 0
+			for (i = 1; i <= n; i++) {
+				if (skip) { skip = 0; continue }
+				if (t[i] == "claude") continue
+				# Drop the flags that select a session; we supply our own.
+				if (t[i] == "--session-id" || t[i] == "-n" || t[i] == "--name") { skip = 1; continue }
+				if (t[i] == "-c" || t[i] == "--continue") continue
+				if (t[i] == "-r" || t[i] == "--resume") {
+					# --resume may carry an id or stand alone before another flag.
+					if (i < n && t[i+1] ~ /^[0-9a-fA-F][0-9a-fA-F-]*$/) skip = 1
+					continue
+				}
+				out = out " " t[i]   # anything else is a real flag worth keeping
+			}
+			return "claude --resume " sid out
+		}
+		BEGIN {
+			while ((getline line < mapfile) > 0) {
+				if (split(line, f, "\t") >= 4) sid[f[1] SUBSEP f[2] SUBSEP f[3]] = f[4]
+			}
+		}
+		$1 == "pane" && $10 == "claude" {
+			key = $2 SUBSEP $3 SUBSEP $6
+			if (key in sid) {
+				cmdline = $11
+				sub(/^:/, "", cmdline)
+				# The extra space after the ':' is deliberate. Resurrect types
+				# this back with send-keys, and fish (like bash ignorespace)
+				# refuses to write a leading-space command to history, so a
+				# restore no longer fills history with --resume uuids. It also
+				# forces the "~claude --resume" form in @resurrect-processes:
+				# the plain entry anchors on ^claude and would stop matching.
+				$11 = ": " normalize(cmdline, sid[key])
+			}
+			# If the id could not be resolved the line is left untouched on
+			# purpose: a wrong --resume is worse than the old behaviour.
+		}
+		{ print }
+	' "$_file" >"$_out" && cat "$_out" >"$_file"
+
+	rm -f "$_map" "$_out"
+}
+
+case "${1:-}" in
+	rename)    shift; cmd_rename "${1:-}" ;;
+	unname)    shift; cmd_unname "${1:-}" ;;
+	sweep)     cmd_sweep ;;
+	resurrect) shift; cmd_resurrect "${1:-}" ;;
+	*)
+		echo "usage: claude-tmux-sync {rename|unname|sweep|resurrect <file>} [pane]" >&2
+		exit 2
+		;;
+esac
