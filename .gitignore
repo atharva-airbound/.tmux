@@ -1,1 +1,4 @@
 plugins/**
+
+# backup written by themes/tmux-theme before it rewrites the palette block
+.tmux.conf.local.bak

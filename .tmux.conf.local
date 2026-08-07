@@ -85,24 +85,42 @@ tmux_conf_24b_colour=auto
 #   - tmux_conf_theme_synchronized
 tmux_conf_theme=enabled
 
-# default theme
-tmux_conf_theme_colour_1="#080808"    # dark gray
-tmux_conf_theme_colour_2="#303030"    # gray
-tmux_conf_theme_colour_3="#8a8a8a"    # light gray
-tmux_conf_theme_colour_4="#00afff"    # light blue
-tmux_conf_theme_colour_5="#ffff00"    # yellow
-tmux_conf_theme_colour_6="#080808"    # dark gray
-tmux_conf_theme_colour_7="#e4e4e4"    # white
-tmux_conf_theme_colour_8="#080808"    # dark gray
-tmux_conf_theme_colour_9="#ffff00"    # yellow
-tmux_conf_theme_colour_10="#ff00af"   # pink
-tmux_conf_theme_colour_11="#5fff00"   # green
-tmux_conf_theme_colour_12="#8a8a8a"   # light gray
-tmux_conf_theme_colour_13="#e4e4e4"   # white
-tmux_conf_theme_colour_14="#080808"   # dark gray
-tmux_conf_theme_colour_15="#080808"   # dark gray
-tmux_conf_theme_colour_16="#d70000"   # red
-tmux_conf_theme_colour_17="#e4e4e4"   # white
+# -- palette -------------------------------------------------------------------
+# Managed by tmux-theme -- everything between the markers below is rewritten by
+# that script. To switch themes:
+#
+#   tmux-theme list                     # what's available in themes/
+#   tmux-theme use tokyo-night          # switch to a saved palette
+#   tmux-theme import foo.Xresources    # convert a downloaded theme, then use it
+#
+# These stay inline deliberately. Pulling them in with 'source-file' appears to
+# work but silently breaks the ~40 derived lines below: tmux expands $var at
+# parse time, while source-file only applies at execution time, so every
+# reference (e.g. tmux_conf_theme_status_left_bg) would expand to empty.
+#
+# Slot roles: 1 background, 2 surface, 3 inactive window text, 4 accent (active
+# window + active pane border), 5 bell, 6/9 status-left fg/bg, 12/15 status-right
+# fg/bg, 16 synchronize-panes border.
+
+# >>> palette: catppuccin-mocha >>>
+tmux_conf_theme_colour_1="#1e1e2e"    # background
+tmux_conf_theme_colour_2="#313244"    # surface
+tmux_conf_theme_colour_3="#7f849c"    # inactive window text
+tmux_conf_theme_colour_4="#89b4fa"    # accent
+tmux_conf_theme_colour_5="#f9e2af"    # bell
+tmux_conf_theme_colour_6="#1e1e2e"    # status-left fg
+tmux_conf_theme_colour_7="#cdd6f4"    # text
+tmux_conf_theme_colour_8="#1e1e2e"    # status fg (alt)
+tmux_conf_theme_colour_9="#cba6f7"    # status-left bg
+tmux_conf_theme_colour_10="#f5c2e7"   # status-left bg 2
+tmux_conf_theme_colour_11="#a6e3a1"   # status-left bg 3
+tmux_conf_theme_colour_12="#7f849c"   # status-right fg
+tmux_conf_theme_colour_13="#cdd6f4"   # text
+tmux_conf_theme_colour_14="#1e1e2e"   # status-right fg (alt)
+tmux_conf_theme_colour_15="#1e1e2e"   # status-right bg
+tmux_conf_theme_colour_16="#f38ba8"   # synchronize-panes
+tmux_conf_theme_colour_17="#cdd6f4"   # text
+# <<< palette <<<
 
 # default theme (ansi)
 #tmux_conf_theme_colour_1="colour0"
@@ -233,10 +251,10 @@ tmux_conf_theme_window_status_last_bg="$tmux_conf_theme_colour_2"
 tmux_conf_theme_window_status_last_attr="none"
 
 # status left/right sections separators
-tmux_conf_theme_left_separator_main=""
-tmux_conf_theme_left_separator_sub="|"
-tmux_conf_theme_right_separator_main=""
-tmux_conf_theme_right_separator_sub="|"
+tmux_conf_theme_left_separator_main=''  # rounded caps; needs a Nerd Font or
+tmux_conf_theme_left_separator_sub=''   #   PowerlineSymbols.otf. revert to
+tmux_conf_theme_right_separator_main='' #   "" and "|" if they render as
+tmux_conf_theme_right_separator_sub=''  #   tofu boxes
 #tmux_conf_theme_left_separator_main='\uE0B0'  # /!\ you don't need to install Powerline
 #tmux_conf_theme_left_separator_sub='\uE0B1'   #   you only need fonts patched with
 #tmux_conf_theme_right_separator_main='\uE0B2' #   Powerline symbols or the standalone
@@ -384,6 +402,11 @@ tmux_conf_urlscan_options="--compact --dedupe"
 # -- user customizations -------------------------------------------------------
 
 # this is the place to override or undo settings
+
+# 24-bit colour, set directly rather than relying on tmux_conf_24b_colour above:
+# _apply_24b skips the override when TERM matches screen-*|tmux-*, which is always
+# the case for the shell tmux spawns, so the setting alone never fires on reload
+set -as terminal-features ",*256col*:RGB"
 
 # increase history size
 #set -g history-limit 10000

@@ -1,0 +1,311 @@
+#!/usr/bin/env python3
+"""Manage the Oh my tmux! palette from standard Xresources theme files.
+
+The 17 tmux_conf_theme_colour_* slots must live inline in .tmux.conf.local --
+tmux expands $var at parse time, so a palette pulled in with 'source-file' would
+leave every derived line (status_left_bg, pane_active_border, ...) empty. This
+script therefore rewrites the block between the palette markers in place.
+
+Themes in themes/ may be stored either as a converted palette (<name>.conf, the
+17 slots) or as the standard file you downloaded (<name>.Xresources), which is
+converted on use. So a downloaded theme can simply be dropped into themes/.
+
+    tmux-theme list
+    tmux-theme use <name>
+    tmux-theme import <file.Xresources> [--name NAME] [--use]
+    tmux-theme current
+
+'import' is only needed to snapshot a conversion as a .conf you can hand-tune;
+copying the file into themes/ is enough to use it as-is.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# realpath, not abspath: this script is normally invoked through a symlink in
+# ~/.local/bin, and the repo paths below must resolve relative to the real file
+HERE = os.path.dirname(os.path.realpath(__file__))
+THEMES_DIR = HERE
+LOCAL_CONF = os.path.join(os.path.dirname(HERE), ".tmux.conf.local")
+
+BEGIN_RE = re.compile(r"^# >>> palette(?::\s*(\S+))? >>>\s*$")
+END = "# <<< palette <<<"
+
+# Xresources keys we care about, e.g. "*.color4:", "URxvt*color4:", "*background:"
+XRES_RE = re.compile(
+    r"^\s*[^!\n]*?[.*]\s*(color\d{1,2}|background|foreground)\s*:\s*(#[0-9a-fA-F]{6})\b",
+    re.IGNORECASE,
+)
+
+SLOT_LABELS = {
+    1: "background", 2: "surface", 3: "inactive window text", 4: "accent",
+    5: "bell", 6: "status-left fg", 7: "text", 8: "status fg (alt)",
+    9: "status-left bg", 10: "status-left bg 2", 11: "status-left bg 3",
+    12: "status-right fg", 13: "text", 14: "status-right fg (alt)",
+    15: "status-right bg", 16: "synchronize-panes", 17: "text",
+}
+
+
+def die(msg):
+    print(f"tmux-theme: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def parse_xresources(path):
+    """Return {'background':.., 'foreground':.., 'color0'..'color15':..}."""
+    try:
+        raw = open(path, encoding="utf-8", errors="replace").read()
+    except OSError as e:
+        die(f"cannot read {path}: {e}")
+
+    found = {}
+    for line in raw.splitlines():
+        if line.lstrip().startswith("!"):  # Xresources comment
+            continue
+        m = XRES_RE.match(line)
+        if m:
+            found[m.group(1).lower()] = m.group(2).lower()
+
+    missing = [k for k in ("background", "foreground") if k not in found]
+    missing += [f"color{i}" for i in range(16) if f"color{i}" not in found]
+    if missing:
+        die(
+            f"{path} is missing {len(missing)} required key(s): "
+            + ", ".join(missing[:6])
+            + ("..." if len(missing) > 6 else "")
+            + "\n           expected Xresources lines like '*.color4: #89b4fa'"
+        )
+    return found
+
+
+def map_to_slots(x):
+    """Map Xresources keys onto the 17 Oh my tmux! slots.
+
+    ANSI has no dedicated 'surface' or 'muted text', so colour0 (black) and
+    colour8 (bright black) stand in -- that is what they are used for in
+    practice by essentially every modern scheme.
+    """
+    bg, fg = x["background"], x["foreground"]
+    return {
+        1: bg,             # background
+        2: x["color0"],    # surface / selection
+        3: x["color8"],    # inactive window text (bright black == muted)
+        4: x["color4"],    # accent: active window + active pane border
+        5: x["color3"],    # bell (yellow)
+        6: bg,             # status-left segment 1 fg (dark on accent)
+        7: fg,
+        8: bg,
+        9: x["color5"],    # status-left segment 1 bg (magenta)
+        10: x["color6"],   # segment 2 bg (cyan)
+        11: x["color2"],   # segment 3 bg (green)
+        12: x["color8"],   # status-right segment 1 fg (muted)
+        13: fg,
+        14: bg,
+        15: bg,            # status-right segment 1 bg (flat on the bar)
+        16: x["color1"],   # synchronize-panes border (red)
+        17: fg,
+    }
+
+
+def slots_from_theme_file(path):
+    """Read the 17 slots out of a themes/*.conf file."""
+    slots = {}
+    for line in open(path, encoding="utf-8"):
+        m = re.match(r'^\s*tmux_conf_theme_colour_(\d{1,2})\s*=\s*"?(#[0-9a-fA-F]{6})"?', line)
+        if m:
+            slots[int(m.group(1))] = m.group(2).lower()
+    missing = [i for i in range(1, 18) if i not in slots]
+    if missing:
+        die(f"{path} is missing slot(s): {missing}")
+    return slots
+
+
+def render_theme_file(name, slots, source=None):
+    out = [f"# {name}"]
+    if source:
+        out.append(f"# converted from {source}")
+    out.append("")
+    for i in range(1, 18):
+        out.append(f'tmux_conf_theme_colour_{i}="{slots[i]}"'.ljust(38) + f"# {SLOT_LABELS[i]}")
+    return "\n".join(out) + "\n"
+
+
+# Themes may be stored either as a converted palette (.conf, 17 slots) or as the
+# standard file you downloaded (.Xresources/.Xdefaults), which is converted on
+# use. Drop a download straight into themes/ and it just works; 'import' is only
+# needed when you want a converted snapshot to hand-tune.
+XRES_EXTS = (".Xresources", ".Xdefaults")
+
+
+def theme_path(name):
+    return os.path.join(THEMES_DIR, f"{name}.conf")
+
+
+def find_theme(name):
+    """Return (path, kind) for a theme name; kind is 'conf' or 'xresources'."""
+    conf = theme_path(name)
+    if os.path.exists(conf):
+        return conf, "conf"
+    for ext in XRES_EXTS:
+        for candidate in (f"{name}{ext}", f"{name}{ext.lower()}"):
+            p = os.path.join(THEMES_DIR, candidate)
+            if os.path.exists(p):
+                return p, "xresources"
+    return None, None
+
+
+def list_themes():
+    names = set()
+    for f in os.listdir(THEMES_DIR):
+        if f.endswith(".conf"):
+            names.add(f[:-5])
+        else:
+            for ext in XRES_EXTS:
+                if f.lower().endswith(ext.lower()):
+                    names.add(f[: -len(ext)])
+    return sorted(names)
+
+
+def load_slots(name):
+    """Resolve a theme name to its 17 slots, converting Xresources if needed."""
+    path, kind = find_theme(name)
+    if path is None:
+        die(f"no such theme '{name}'. Available: {', '.join(list_themes()) or '(none)'}")
+    if kind == "conf":
+        return slots_from_theme_file(path), path
+    return map_to_slots(parse_xresources(path)), path
+
+
+def read_local():
+    try:
+        return open(LOCAL_CONF, encoding="utf-8").read().split("\n")
+    except OSError as e:
+        die(f"cannot read {LOCAL_CONF}: {e}")
+
+
+def find_markers(lines):
+    begin = end = None
+    current = None
+    for i, line in enumerate(lines):
+        m = BEGIN_RE.match(line)
+        if m:
+            begin, current = i, m.group(1)
+        elif line.strip() == END and begin is not None:
+            end = i
+            break
+    if begin is None or end is None:
+        die(
+            f"palette markers not found in {LOCAL_CONF}\n"
+            f"           expected a '# >>> palette >>>' / '{END}' pair"
+        )
+    return begin, end, current
+
+
+def cmd_current(_args):
+    _, _, name = find_markers(read_local())
+    print(name or "(unnamed)")
+
+
+def cmd_list(_args):
+    _, _, current = find_markers(read_local())
+    names = list_themes()
+    if not names:
+        print("no themes in", THEMES_DIR)
+        return
+    width = max(len(n) for n in names)
+    for n in names:
+        _, kind = find_theme(n)
+        label = "palette" if kind == "conf" else "Xresources"
+        print(("* " if n == current else "  ") + n.ljust(width + 2) + label)
+
+
+def cmd_use(args):
+    slots, path = load_slots(args.name)
+
+    lines = read_local()
+    begin, end, _ = find_markers(lines)
+    block = [f"# >>> palette: {args.name} >>>"]
+    block += [
+        f'tmux_conf_theme_colour_{i}="{slots[i]}"'.ljust(38) + f"# {SLOT_LABELS[i]}"
+        for i in range(1, 18)
+    ]
+    block.append(END)
+
+    shutil.copy2(LOCAL_CONF, LOCAL_CONF + ".bak")
+    lines[begin : end + 1] = block
+    open(LOCAL_CONF, "w", encoding="utf-8").write("\n".join(lines))
+    print(f"applied '{args.name}' from {os.path.basename(path)}")
+
+    if not args.no_reload:
+        reload_tmux()
+
+
+def cmd_import(args):
+    name = args.name or re.sub(r"\.(xresources|xdefaults|xrdb|txt|conf)$", "",
+                               os.path.basename(args.file), flags=re.IGNORECASE)
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower() or "imported"
+
+    slots = map_to_slots(parse_xresources(args.file))
+    dest = theme_path(name)
+    if os.path.exists(dest) and not args.force:
+        die(f"{dest} already exists (pass --force to overwrite)")
+    open(dest, "w", encoding="utf-8").write(
+        render_theme_file(name, slots, source=os.path.basename(args.file))
+    )
+    print(f"wrote {dest}")
+
+    if args.use:
+        cmd_use(argparse.Namespace(name=name, no_reload=args.no_reload))
+    else:
+        print(f"run 'tmux-theme use {name}' to apply it")
+
+
+def reload_tmux():
+    conf = os.environ.get("TMUX_CONF")
+    if not conf:
+        for cand in ("~/.config/tmux/tmux.conf", "~/.tmux.conf"):
+            if os.path.exists(os.path.expanduser(cand)):
+                conf = os.path.expanduser(cand)
+                break
+    if not conf:
+        print("could not locate tmux.conf; reload manually with <prefix> r")
+        return
+    try:
+        subprocess.run(["tmux", "source", conf], check=True)
+        print(f"reloaded {conf}")
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"reload failed ({e}); reload manually with <prefix> r")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="tmux-theme", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--no-reload", action="store_true", help="edit the config but do not reload tmux")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("list", help="list themes in themes/").set_defaults(func=cmd_list)
+    sub.add_parser("current", help="print the active theme name").set_defaults(func=cmd_current)
+
+    u = sub.add_parser("use", help="apply a saved theme")
+    u.add_argument("name")
+    u.set_defaults(func=cmd_use)
+
+    i = sub.add_parser("import", help="convert an Xresources theme file")
+    i.add_argument("file")
+    i.add_argument("--name", help="theme name (default: derived from filename)")
+    i.add_argument("--use", action="store_true", help="apply it immediately")
+    i.add_argument("--force", action="store_true", help="overwrite an existing theme")
+    i.set_defaults(func=cmd_import)
+
+    args = p.parse_args()
+    if not hasattr(args, "no_reload"):
+        args.no_reload = False
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
